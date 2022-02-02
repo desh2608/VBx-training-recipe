@@ -17,11 +17,10 @@ import math
 import torch
 
 import torch.nn as nn
-import horovod.torch as hvd
 
-from utils.pytorch_data import KaldiArkDataset
+from utils.pytorch_data import KaldiArkDataset, KaldiArkDatasetMultiSpeaker
 from utils import ze_utils
-from models.metrics import AddMarginProduct, ArcMarginProduct, SphereProduct
+from models.metrics import AddMarginProduct, AddMarginProductMulti, ArcMarginProduct, SphereProduct
 from models.resnet2 import *
 
 
@@ -67,7 +66,7 @@ def get_args():
                         help="Shows the class name which should be defined in models/*.py file.")
 
     parser.add_argument("--metric", type=str, dest='metric', default="linear",
-                        choices=['linear', 'add_margin', 'arc_margin', 'sphere'],
+                        choices=['linear', 'add_margin', 'add_margin_multi', 'arc_margin', 'sphere'],
                         help="Shows the custum metric that should be used as last layer.")
 
     parser.add_argument("--dir", type=str, required=True,
@@ -145,6 +144,8 @@ def get_args():
     parser.add_argument('--squeeze-excitation', default=False, action='store_true',
                         help='use squeeze excitation layers')
 
+    parser.add_argument('--multi-speaker', default=False, action='store_true', help='multi-speaker training')
+
     args = parser.parse_args()
 
     args = process_args(args)
@@ -188,7 +189,7 @@ def process_args(args):
 
 
 def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, criterion,
-                        device, log_interval, len_train_sampler):
+                        device, log_interval, len_train_sampler=1):
     """ Called from train for one iteration of neural network training
 
     Selected args:
@@ -215,34 +216,59 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
                 data = data[:, ss::args.frame_downsampling + 1, :]
 
             data = data.to(torch.device(device=device))
-            target = target.to(torch.device(device=device))
             data = data.transpose(1, 2)
             optimizer.zero_grad()
             output = model(data)
-            if args.metric == 'linear':
-                output = model.metric(output)
+            if not args.multi_speaker:
+                target = target.to(torch.device(device=device))
+                if args.metric == 'linear':
+                    output = model.metric(output)
+                else:
+                    output = model.metric(output, target)
+                loss = criterion(output, target)
+                predict = output.max(1)[1]
+                num_correct += predict.eq(target).sum().item()
             else:
-                output = model.metric(output, target)
+                target_dict = {i:[j for j in range(len(target[i])) if target[i][j] == 1] for i in range(len(target))}
+                target1 = torch.zeros_like(target)
+                target2 = torch.zeros_like(target)
+                for i, labels in target_dict.items():
+                    target1[i][labels[0]] = 1   # first non-zero label
+                    target2[i][labels[-1]] = 1  # last non-zero label
+                target1 = target1.to(torch.device(device=device))
+                target2 = target2.to(torch.device(device=device))
+                assert args.metric == 'add_margin_multi'
+                output1, output2 = model.metric(output, target1, target2)
+                target1 = target1.float()
+                target2 = target2.float()
+                # Get uPIT loss since we can predict either target on the outputs
+                loss = 0
+                for i in range(len(output1)):
+                    loss11 = criterion(output1[i:i+1], target1[i:i+1])
+                    loss22 = criterion(output2[i:i+1], target2[i:i+1])
+                    loss12 = criterion(output1[i:i+1], target2[i:i+1])
+                    loss21 = criterion(output2[i:i+1], target1[i:i+1])
+                    loss += min(loss11+loss22, loss12+loss21)   # PIT
+                    y_pred1 = output1[i].argmax()
+                    y_pred2 = output2[i].argmax()
+                    y_true1 = target1[i].argmax()
+                    y_true2 = target2[i].argmax()
+                    # if either prediction is correct, we count is as correct
+                    # if i%100 == 0:
+                    #     logger.info(f'Sample {i}: Preds: {y_pred1} {y_pred2} True: {y_true1} {y_true2}\n')
+                    if y_pred1 == y_true1 or y_pred1 == y_true2:
+                        num_correct += 0.5
+                    if y_pred2 == y_true1 or y_pred2 == y_true2:
+                        num_correct += 0.5
 
-            loss = criterion(output, target)
-
-            if APEX_AVAILABLE:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                    optimizer.synchronize()
-                with optimizer.skip_synchronize():
-                    optimizer.step()
-            else:
-                loss.backward()
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
             loss = loss.item()
             iter_loss += loss
-            predict = output.max(1)[1]
-            num_correct += predict.eq(target).sum().item()
             num_total += len(data)
             total_gpu_waiting += time.time() - gpu_waiting
-            if batch_idx > 0 and batch_idx % log_interval == 0 and hvd.rank() == 0:
+            if batch_idx > 0 and batch_idx % log_interval == 0:
                 # use train_sampler to determine the number of examples in this worker's partition.
                 logger.info(f'Train Iter: {_iter} [{batch_idx * len(data)}/{len_train_sampler} '
                             f'({100.0 * batch_idx / len_data_loader:.0f}%)]  Loss: {loss:.6f}')
@@ -257,26 +283,23 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
     acc = num_correct * 1.0 / num_total
     iter_loss /= len_data_loader
 
-    # save the model and do logging in worker with rank zero
-    args.processed_archives += hvd.size()
-    if hvd.rank() == 0:
-        logger.info(f'Iteration Loss: {iter_loss:.4f}  Accuracy: {acc * 100:.2f}%')
-        logger.info(f'Elapsed time: {(time.time() - start_time) / 60.0:.2f} minutes '
-                    f'and GPU waiting: {total_gpu_waiting / 60.0:.2f} minutes.')
-        new_model_path = os.path.join(main_dir, 'models', f'raw_{_iter}.pth')
-        logger.info(f'Saving model to: {new_model_path}')
-        saving_model = model
-        while isinstance(saving_model, torch.nn.DataParallel):
-            saving_model = saving_model.module
-        _save_checkpoint(
-            {
-                'processed_archives': args.processed_archives,
-                'class_name': args.model,
-                'frame_downsampling': args.frame_downsampling,
-                'state_dict': saving_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            },
-            file_name=new_model_path)
+    # save the model and do logging
+    logger.info(f'Iteration Loss: {iter_loss:.4f}  Accuracy: {acc * 100:.2f}%')
+    logger.info(f'Elapsed time: {(time.time() - start_time) / 60.0:.2f} minutes '
+                f'and GPU waiting: {total_gpu_waiting / 60.0:.2f} minutes.')
+    new_model_path = os.path.join(main_dir, 'models', f'raw_{_iter}.pth')
+    logger.info(f'Saving model to: {new_model_path}')
+    saving_model = model
+    while isinstance(saving_model, torch.nn.DataParallel):
+        saving_model = saving_model.module
+    _save_checkpoint(
+        {
+            'class_name': args.model,
+            'frame_downsampling': args.frame_downsampling,
+            'state_dict': saving_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+        },
+        file_name=new_model_path)
 
 
 def eval_network(model, data_loader, device):
@@ -354,24 +377,13 @@ def train(args):
     """
 
     egs_dir = args.egs_dir
-    # initialize horovod
-    hvd.init()
 
     # verify egs dir and extract parameters
     [num_archives, egs_feat_dim, arks_num_egs] = ze_utils.verify_egs_dir(egs_dir)
+    logger.info(f'Number of examples in each ark: {arks_num_egs}')
     assert arks_num_egs > 0
 
     device = 'cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu'
-    torch.cuda.set_device(hvd.local_rank())
-
-    if hvd.rank() == 0:
-        logger.info(f'Device is: {device}')
-
-    num_jobs = hvd.size()
-    if hvd.rank() == 0:
-        logger.info(f'Using {num_jobs} training jobs.')
-    if num_jobs > num_archives:
-        raise ValueError('num_jobs cannot exceed the number of archives in the egs directory')
 
     init_model_path = args.model_init
 
@@ -379,6 +391,8 @@ def train(args):
     try:
         if args.metric == 'add_margin':
             metric_fc = AddMarginProduct(args.embed_dim, args.num_targets, s=32, m=0.2)
+        elif args.metric == 'add_margin_multi':
+            metric_fc = AddMarginProductMulti(args.embed_dim, args.num_targets, s=32, m=0.2)
         elif args.metric == 'arc_margin':
             metric_fc = ArcMarginProduct(args.embed_dim, args.num_targets, s=32, m=0.2)
         elif args.metric == 'sphere':
@@ -392,8 +406,6 @@ def train(args):
 
         # load the init model if exist. This is useful when loading from a pre-trained model
         if init_model_path is not None:
-            if hvd.rank() == 0:
-                logger.info(f'Loading the initial network from: {init_model_path}')
             checkpoint = torch.load(init_model_path, map_location='cpu')
             model.load_state_dict(checkpoint['state_dict'], strict=False)
     except AttributeError:
@@ -404,25 +416,27 @@ def train(args):
     # move model to device before creating optimizer
     model = model.to(torch.device(device=device))
 
+    # print number of params in model
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f'The model has {num_params} trainable parameters.')
     parameters = model.parameters()
 
     # scale learning rate by the number of GPUs.
     if args.optimizer == 'SGD':
-        main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate * num_jobs,
+        main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate,
                                          momentum=args.momentum, weight_decay=args.optimizer_weight_decay,
                                          nesterov=True)
     elif args.optimizer == 'Adam':
-        main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate * num_jobs,
+        main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate,
                                           weight_decay=args.optimizer_weight_decay)
     else:
         raise ValueError(f'Invalid optimizer {args.optimizer}.')
 
-    if hvd.rank() == 0:
-        logger.info(str(model))
-        logger.info(str(main_optimizer))
+    logger.info(str(model))
+    logger.info(str(main_optimizer))
 
     processed_archives = 0
-    if init_model_path is not None and hvd.rank() == 0:
+    if init_model_path is not None:
         logger.info(f'Saving the initial network to: {init_model_path}')
         _save_checkpoint({
             'processed_archives': processed_archives,
@@ -433,17 +447,16 @@ def train(args):
         }, file_name=init_model_path)
 
     # save kaldi's files
-    if hvd.rank() == 0:
-        with open(os.path.join(args.dir, 'models', 'model_info'), 'wt') as fid:
-            fid.write(f'{args.model} {egs_feat_dim} {args.num_targets}{os.linesep}')
-        with open(os.path.join(args.dir, 'models', 'config.txt'), 'wt') as fid:
-            fid.write(str(model))
-        with open(os.path.join(args.dir, 'command.sh'), 'wt') as fid:
-            fid.write(' '.join(sys.argv) + '\n')
-        with open(os.path.join(args.dir, 'max_chunk_size'), 'wt') as fid:
-            fid.write(f'10000{os.linesep}')
-        with open(os.path.join(args.dir, 'min_chunk_size'), 'wt') as fid:
-            fid.write(f'25{os.linesep}')
+    with open(os.path.join(args.dir, 'models', 'model_info'), 'wt') as fid:
+        fid.write(f'{args.model} {egs_feat_dim} {args.num_targets}{os.linesep}')
+    with open(os.path.join(args.dir, 'models', 'config.txt'), 'wt') as fid:
+        fid.write(str(model))
+    with open(os.path.join(args.dir, 'command.sh'), 'wt') as fid:
+        fid.write(' '.join(sys.argv) + '\n')
+    with open(os.path.join(args.dir, 'max_chunk_size'), 'wt') as fid:
+        fid.write(f'10000{os.linesep}')
+    with open(os.path.join(args.dir, 'min_chunk_size'), 'wt') as fid:
+        fid.write(f'25{os.linesep}')
 
     # find the last saved model and load it
     saved_models = glob.glob(os.path.join(args.dir, 'models', 'raw_*.pth'))
@@ -458,54 +471,39 @@ def train(args):
 
     if finished_iterations > 0:
         model_path = os.path.join(args.dir, 'models', f'raw_{finished_iterations}.pth')
-        if hvd.rank() == 0:
-            logger.info('Loading model from ' + model_path)
+        logger.info('Loading model from ' + model_path)
 
         checkpoint = torch.load(model_path, map_location='cpu')
-        processed_archives = checkpoint['processed_archives']
+        processed_archives = checkpoint.get('processed_archives', 0)
         model.load_state_dict(checkpoint['state_dict'])
         main_optimizer.load_state_dict(checkpoint['optimizer'])
 
     # note: here minibatch is the size before
-    train_dataset = KaldiArkDataset(egs_dir=egs_dir, num_archives=num_archives, num_workers=num_jobs, rank=hvd.rank(),
-                                    num_examples_in_each_ark=arks_num_egs, finished_iterations=finished_iterations,
-                                    processed_archives=processed_archives, apply_cmn=args.apply_cmn)
+    if args.multi_speaker:
+        train_dataset = KaldiArkDatasetMultiSpeaker(egs_dir=egs_dir, num_targets=args.num_targets, num_archives=num_archives, 
+                                        num_workers=1, rank=0, num_examples_in_each_ark=arks_num_egs, 
+                                        finished_iterations=finished_iterations, processed_archives=processed_archives, 
+                                        apply_cmn=args.apply_cmn)
+    else:
+        train_dataset = KaldiArkDataset(egs_dir=egs_dir, num_archives=num_archives, num_workers=1, rank=0,
+                                        num_examples_in_each_ark=arks_num_egs, finished_iterations=finished_iterations,
+                                        processed_archives=processed_archives, apply_cmn=args.apply_cmn)
 
-    # use DistributedSampler to partition the training data.
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=num_jobs, rank=hvd.rank())
 
     kwargs = {'drop_last': False, 'pin_memory': False}
     train_loader = torch.utils.data.DataLoader(
         train_dataset, 
         batch_size=args.minibatch_size, 
-        sampler=train_sampler, 
         **kwargs)
-
-    # (optional) compression algorithm. TODO add better compression method
-    compression = hvd.Compression.fp16 if args.fp16_compression else hvd.Compression.none
-    #
-    # wrap optimizer with DistributedOptimizer.
-    optimizer = hvd.DistributedOptimizer(main_optimizer, named_parameters=model.named_parameters(),
-                                         compression=compression)
-
-    # broadcast parameters & optimizer state.
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     criterion = nn.CrossEntropyLoss()
     args.processed_archives = processed_archives
 
     # set num_iters so that as close as possible, we process the data
-    num_iters = int(args.num_epochs * num_archives * 1.0 / num_jobs)
-    num_archives_to_process = int(num_iters * num_jobs)
+    num_iters = int(args.num_epochs * num_archives)
+    num_archives_to_process = int(num_iters)
 
-    # initialize APEX
-    if APEX_AVAILABLE:
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1', loss_scale='dynamic')
-
-    if hvd.rank() == 0:
-        logger.info(f'Training will run for {args.num_epochs} epochs = {num_iters} iterations')
+    logger.info(f'Training will run for {args.num_epochs} epochs = {num_iters} iterations')
 
     for _iter in range(finished_iterations, num_iters):
         percent = args.processed_archives * 100.0 / num_archives_to_process
@@ -534,22 +532,17 @@ def train(args):
                                               / num_archives_to_process_margin_m) * args.initial_margin_m
             model.metric.m = effective_margin_m
 
-        coeff = num_jobs
-        if _iter < args.warmup_epochs > 0 and num_jobs > 1:
-            coeff = float(_iter) * (num_jobs - 1) / args.warmup_epochs + 1.0
+        for param_group in main_optimizer.param_groups:
+            param_group['lr'] = effective_learning_rate
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = effective_learning_rate * coeff
+        lr = effective_learning_rate
 
-        if hvd.rank() == 0:
-            lr = optimizer.param_groups[0]['lr']
-
-            if args.metric == 'linear':
-                logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
-                            f'  ({percent:0.1f}% complete)  lr: {lr:0.5f}')
-            else:
-                logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
-                            f'  ({percent:0.1f}% complete)  lr: {lr:0.5f} margin: {model.metric.m:0.4f}')
+        if args.metric == 'linear':
+            logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
+                        f'  ({percent:0.1f}% complete)  lr: {lr:0.5f}')
+        else:
+            logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
+                        f'  ({percent:0.1f}% complete)  lr: {lr:0.5f} margin: {model.metric.m:0.4f}')
 
         train_dataset.set_iteration(_iter + 1)
 
@@ -559,20 +552,18 @@ def train(args):
             _iter=_iter + 1,
             model=model,
             data_loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
+            optimizer=main_optimizer,
+            criterion=nn.CrossEntropyLoss(),
             device=device,
-            log_interval=500,
-            len_train_sampler=len(train_sampler))
+            log_interval=500)
 
-        if args.cleanup and hvd.rank() == 0:
+        if args.cleanup:
             # do a clean up everything but the last 2 models, under certain conditions
             _remove_model(args.dir, _iter - 2, args.preserve_model_interval)
 
-    if hvd.rank() == 0:
-        ze_utils.force_symlink(f'raw_{num_iters}.pth', os.path.join(args.dir, 'models', 'model_final'))
+    ze_utils.force_symlink(f'raw_{num_iters}.pth', os.path.join(args.dir, 'models', 'model_final'))
 
-    if args.cleanup and hvd.rank() == 0:
+    if args.cleanup:
         logger.info(f'Cleaning up the experiment directory {args.dir}')
         for _iter in range(num_iters - 2):
             _remove_model(args.dir, _iter, args.preserve_model_interval)
@@ -591,7 +582,7 @@ if __name__ == '__main__':
         # what we get when a background thread dies.
         if not isinstance(e, KeyboardInterrupt):
             traceback.print_exc()
-        if os.path.exists('using_gpus.txt') and hvd.rank() == 0:
+        if os.path.exists('using_gpus.txt'):
             logger.info('Removing using_gpus.txt file')
             os.remove('using_gpus.txt')
         sys.exit(1)

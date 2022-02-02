@@ -200,7 +200,7 @@ def background_command_waiter(command, popen_object, require_zero_status):
         a separate thread."""
 
     popen_object.communicate()
-    if popen_object.returncode is not 0:
+    if popen_object.returncode != 0:
         _str = "Command exited with status {0}: {1}".format(popen_object.returncode, command)
         if require_zero_status:
             logger.error(_str)
@@ -456,7 +456,7 @@ def get_command_stdout(command, require_zero_status=True):
     p = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
 
     stdout = p.communicate()[0]
-    if p.returncode is not 0:
+    if p.returncode != 0:
         output = "Command exited with status {0}: {1}".format(p.returncode, command)
         if require_zero_status:
             raise Exception(output)

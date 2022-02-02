@@ -105,6 +105,51 @@ class AddMarginProduct(nn.Module):
                + ', m=' + str(self.m) + ')'
 
 
+class AddMarginProductMulti(nn.Module):
+    r"""Implement of large margin cosine distance for multi-speaker training: :
+    Args:
+        in_features: size of each input sample
+        out_features: size of each output sample
+        s: norm of input feature
+        m: margin
+        cos(theta) - m
+    """
+
+    def __init__(self, in_features, out_features, s=30.0, m=0.40):
+        super(AddMarginProductMulti, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight1 = Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight1)
+        self.weight2 = Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight2)
+
+    def forward(self, input, label1, label2):
+        # --------------------------- cos(theta) & phi(theta) ---------------------------
+        cosine1 = F.linear(F.normalize(input), F.normalize(self.weight1))
+        phi1 = cosine1 - self.m
+        cosine2 = F.linear(F.normalize(input), F.normalize(self.weight2))
+        phi2 = cosine2 - self.m
+        # --------------------------- convert label to one-hot ---------------------------
+        # Labels are already one-hot tensors so we don't need to convert anything here
+        # -------------torch.where(out_i = {x_i if condition_i else y_i) -------------
+        output1 = (label1 * phi1) + ((1.0 - label1) * cosine1)
+        output2 = (label2 * phi2) + ((1.0 - label2) * cosine2)
+        output1 *= self.s
+        output2 *= self.s
+        # print(output)
+
+        return output1, output2
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(' \
+               + 'in_features=' + str(self.in_features) \
+               + ', out_features=' + str(self.out_features) \
+               + ', s=' + str(self.s) \
+               + ', m=' + str(self.m) + ')'
+
 class SphereProduct(nn.Module):
     r"""Implement of large margin cosine distance: :
     Args:

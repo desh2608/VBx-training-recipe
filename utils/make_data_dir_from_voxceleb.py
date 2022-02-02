@@ -14,12 +14,15 @@ def add_file(args, speaker, video_link, video_chunk, video_chunk_path):
     if args.format == 'wav':
         if not video_chunk_path.endswith('.wav'):
             return
-        utt = os.path.join(args.dataset_name, speaker, video_link, video_chunk).replace('.wav', '')
+        utt = f"{speaker}_{video_link}_{video_chunk}".replace(".wav", "")
+        # utt = os.path.join(args.dataset_name, speaker, video_link, video_chunk).replace('.wav', '')
     elif args.format == 'raw':
         if not video_chunk_path.endswith('.raw'):
             return
-        utt = os.path.join(args.dataset_name, speaker, video_link, video_chunk).replace('.raw', '')
-    utt2spk[utt] = f'{args.dataset_name}/{speaker}'
+        utt = f"{speaker}_{video_link}_{video_chunk}".replace(".raw", "")
+        # utt = os.path.join(args.dataset_name, speaker, video_link, video_chunk).replace('.raw', '')
+    # utt2spk[utt] = f'{args.dataset_name}/{speaker}'
+    utt2spk[utt] = speaker
     if args.format == 'wav':
         utt2physical[utt] = video_chunk_path
     elif args.format == 'raw':
@@ -68,7 +71,8 @@ if __name__ == '__main__':
                     add_file(args, speaker, video_link, video_chunk, video_chunk_path)
     with open(os.path.join(args.out_data_dir, 'wav.scp'), 'w') as f:
         for utt in sorted(utt2spk):
-            f.write(f'{utt}{" cat " if args.format == "wav" else ""}{utt2physical[utt]} |\n')
+            # f.write(f'{utt}{" cat " if args.format == "wav" else ""}{utt2physical[utt]} |\n')
+            f.write(f'{utt} {utt2physical[utt]}\n')
 
     with open(os.path.join(args.out_data_dir, 'utt2spk'), 'w') as f:
         for utt in sorted(utt2spk):
