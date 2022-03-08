@@ -256,9 +256,9 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
                     # if either prediction is correct, we count is as correct
                     # if i%100 == 0:
                     #     logger.info(f'Sample {i}: Preds: {y_pred1} {y_pred2} True: {y_true1} {y_true2}\n')
-                    if y_pred1 == y_true1 or y_pred1 == y_true2:
+                    if y_true1 in [y_pred1, y_pred2]:
                         num_correct += 0.5
-                    if y_pred2 == y_true1 or y_pred2 == y_true2:
+                    if y_true2 in [y_pred1, y_pred2]:
                         num_correct += 0.5
 
             loss.backward()

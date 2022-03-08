@@ -29,8 +29,8 @@ utils/queue-freegpu.pl -l "hostname=c*" --gpu 1 --mem 10G $out_dir/train.log \
       --warmup-epochs 0 \
       --initial-effective-lrate 0.0001 \
       --final-effective-lrate 0.00001 \
-      --initial-margin-m 0.1 \
-      --final-margin-m 0.1 \
+      --initial-margin-m 0.2 \
+      --final-margin-m 0.2 \
       --optimizer SGD \
       --momentum 0.9 \
       --optimizer-weight-decay 0.0001 \
